@@ -2,5 +2,5 @@ streamlit
 pandas
 pillow
 pytesseract
-pdf2image
+pymupdf
 pdfplumber
