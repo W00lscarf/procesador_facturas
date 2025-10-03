@@ -1,5 +1,5 @@
-# app.py (versión robusta OCR + etiquetas a la derecha)
-import io, os, re
+# app.py — Extractor de Facturas (OCR robusto con convert_from_bytes)
+import io, re
 from typing import List, Tuple, Optional
 from dataclasses import dataclass
 from datetime import datetime
@@ -9,7 +9,7 @@ import pandas as pd
 from PIL import Image
 
 import pytesseract
-from pdf2image import convert_from_path
+from pdf2image import convert_from_bytes
 import pdfplumber
 
 st.set_page_config(page_title="Extractor de Facturas (OCR robusto)", layout="wide")
@@ -91,8 +91,7 @@ def lines_dict(words: List[Word]):
 def find_right_value(words: List[Word], label_regex: re.Pattern, value_regex: re.Pattern,
                      x_gap=6, y_tol=18) -> Optional[str]:
     """
-    - Busca etiqueta en una línea
-    - Lee a la derecha en misma línea; si no, intenta en la línea inmediata siguiente a ~mismo Y.
+    Busca etiqueta en una línea, lee a la derecha; si no, intenta línea vecina en misma banda vertical.
     """
     L = lines_dict(words)
     for key, ws in L.items():
@@ -183,7 +182,7 @@ def extract_pdf_text(file_bytes: bytes) -> dict:
     out["fecha_venc"] = to_iso_date(m.group(1)) if m else None
     m = re.search(r'Folio\s*[:\-]?\s*'+FOLIO_PAT, txt, re.IGNORECASE)
     out["folio"] = m.group(1) if m else None
-    m = re.search(r'Forma\s+de\s+pago\s*[:\-]?\s*([A-Za-zÁÉÍÓÚÑáéíóúñ\. ]+)', txt, re.IGNORECASE)
+    m = re.search(r'Forma\s+de\s*pago\s*[:\-]?\s*([A-Za-zÁÉÍÓÚÑáéíóúñ\. ]+)', txt, re.IGNORECASE)
     if m:
         fp = norm_spaces(m.group(1))
         fp = fp.replace("Cr", "Crédito").replace("Cred.", "Crédito").replace("Credito","Crédito")
@@ -196,7 +195,7 @@ def extract_pdf_text(file_bytes: bytes) -> dict:
 
 # ---------- UI ----------
 st.title("🧾 Extractor de Facturas (OCR robusto)")
-st.caption("Lee valores a la derecha de las etiquetas (N°, Fecha Emis., Fecha Venc., Folio, Forma de pago). Soporta PDF e imágenes. Usa OCR a 300 DPI y regex tolerantes.")
+st.caption("Lee valores a la derecha de las etiquetas (N°, Fecha Emis., Fecha Venc., Folio, Forma de pago). Soporta PDF e imágenes. OCR a 300 DPI y regex tolerantes.")
 
 uploads = st.file_uploader("Sube uno o varios archivos (PDF/PNG/JPG).", type=["pdf","png","jpg","jpeg"], accept_multiple_files=True)
 
@@ -205,15 +204,19 @@ if uploads:
     pb = st.progress(0.0)
     for i, f in enumerate(uploads):
         content = f.read()
-        # Raster a 300 DPI para OCR
+        # Raster a 300 DPI para OCR (convert_from_bytes para PDFs)
         try:
             if f.name.lower().endswith(".pdf"):
-                pages = convert_from_path(io.BytesIO(content), dpi=300, fmt="png")
+                pages = convert_from_bytes(content, dpi=300, fmt="png")
             else:
                 pages = [Image.open(io.BytesIO(content)).convert("RGB")]
         except Exception as e:
             st.warning(f"{f.name}: no pude convertir a imagen ({e}). Intento OCR directo.")
-            pages = [Image.open(io.BytesIO(content)).convert("RGB")]
+            try:
+                pages = [Image.open(io.BytesIO(content)).convert("RGB")]
+            except Exception as e2:
+                st.error(f"{f.name}: tampoco pude abrir como imagen ({e2}).")
+                pages = []
 
         combined = {}
         for p_idx, img in enumerate(pages, start=1):
