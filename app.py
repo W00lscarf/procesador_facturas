@@ -30,6 +30,14 @@ CORP_SUFFIXES = ['SPA','SpA','S.A.','SA','LTDA','Ltda','EIRL','LIMITADA']
 BAD_PREFIXES = ["DATOS DESPACHO", "DATOS DESPACHO O INSTALACION", "DATOS DESPACHO O INSTALACIÓN",
                 "DIRECCION", "DIRECCIÓN", "ENVIO", "ENVÍO", "UBICACION", "UBICACIÓN"]
 
+# Whitelist de forma de pago (para PyMuPDF y OCR)
+VALUE_PAGO_RE = re.compile(
+    r'\b(Crédito|Credito|Contado|Débito|Debito|Transferencia|Efectivo|Cheque|'
+    r'Tarjeta(?:\s+de\s+crédito|\s+de\s+debito)?|'
+    r'\d+\s*d[ií]as)\b',
+    re.IGNORECASE
+)
+
 def norm_spaces(s: Optional[str]) -> Optional[str]:
     if s is None: return None
     return re.sub(r'\s+', ' ', s).strip()
@@ -65,6 +73,26 @@ def is_good_provider_line(t: str) -> bool:
         return False
     return any(suf in T for suf in ["SPA","S.A.","LTDA","EIRL","SpA","SA","LIMITADA"])
 
+def normalize_pago(fp: Optional[str]) -> Optional[str]:
+    if not fp:
+        return None
+    # dedup tipo "Créditoédito", arreglar tildes/variantes
+    fp = re.sub(r'(Cr[eé]dito)(?:\s*\1)+', r'\1', fp, flags=re.IGNORECASE)
+    fp = fp.replace("Credito", "Crédito").replace("Debito", "Débito")
+    fp = fp.replace("tarjeta de debito", "Tarjeta de débito")
+    fp = fp.replace("tarjeta de crédito", "Tarjeta de crédito")
+    fp = norm_spaces(fp)
+    mapping = {
+        "credito": "Crédito", "crédito": "Crédito",
+        "debito": "Débito", "débito": "Débito",
+        "contado": "Contado",
+        "transferencia": "Transferencia",
+        "efectivo": "Efectivo",
+        "cheque": "Cheque",
+    }
+    low = fp.lower()
+    return mapping.get(low, fp)
+
 # ----------------- Rasterizar PDF (PyMuPDF) -----------------
 def pdf_to_images(pdf_bytes: bytes, dpi: int = 300) -> list[Image.Image]:
     images = []
@@ -81,12 +109,11 @@ def pdf_to_images(pdf_bytes: bytes, dpi: int = 300) -> list[Image.Image]:
 
 # ----------------- PREPROCESADO OCR -----------------
 def preprocess_for_ocr(img: Image.Image) -> Image.Image:
-    # Escala ×1.5, gris, contraste
+    # Escala ×1.5, gris, contraste, binarización suave
     w, h = img.size
     img = img.resize((int(w*1.5), int(h*1.5)))
     img = ImageOps.grayscale(img)
     img = ImageEnhance.Contrast(img).enhance(1.5)
-    # binarización suave
     img = img.point(lambda x: 0 if x < 200 else 255, mode='1').convert("L")
     return img
 
@@ -146,7 +173,7 @@ def find_adjacent_value(words: List[Word], label_regex: re.Pattern, value_regex:
         return None
 
     def below_value():
-        # busca en líneas siguientes con x cercano y dentro de tolerancia vertical ampliada
+        # busca en líneas siguientes con x cercano y tolerancia vertical ampliada
         for key, ws in L.items():
             if any(label_regex.search(w.text) for w in ws):
                 label_end_x = max([w.right for w in ws if label_regex.search(w.text)])
@@ -167,6 +194,22 @@ def find_adjacent_value(words: List[Word], label_regex: re.Pattern, value_regex:
     else:
         return right_value() or below_value()
 
+def find_same_line_after_colon(words: List[Word], label_regex: re.Pattern, max_tokens=6) -> Optional[str]:
+    """En la línea de la etiqueta, toma tokens después de ':' y recorta."""
+    L = lines_dict(words)
+    for _, ws in L.items():
+        line_text = " ".join([w.text for w in ws])
+        if label_regex.search(line_text):
+            if ':' in line_text:
+                after = line_text.split(':', 1)[1].strip()
+                after = " ".join(after.split()[:max_tokens])
+                return norm_spaces(after)
+            # si no hay ':', usar cola a la derecha como fallback
+            label_end_x = max([w.right for w in ws if label_regex.search(w.text)])
+            tail = " ".join([w.text for w in ws if w.left >= label_end_x + 6])
+            return norm_spaces(" ".join(tail.split()[:max_tokens])) if tail else None
+    return None
+
 # ----------------- PyMuPDF: texto con coords (sin OCR) -----------------
 def extract_by_coords_pdf(pdf_bytes: bytes) -> dict:
     """
@@ -183,7 +226,7 @@ def extract_by_coords_pdf(pdf_bytes: bytes) -> dict:
     value_date  = re.compile(DATE_PAT, re.IGNORECASE)
     value_num   = re.compile(r'(\d{3,})')
     value_folio = re.compile(FOLIO_PAT, re.IGNORECASE)
-    value_pago  = re.compile(r'([A-Za-zÁÉÍÓÚÑáéíóúñ\. ]{3,})')
+    # forma de pago usa la whitelist global VALUE_PAGO_RE
 
     def take_right(line_spans, idx_label, regex):
         x_end = line_spans[idx_label]["bbox"][2]
@@ -194,7 +237,7 @@ def extract_by_coords_pdf(pdf_bytes: bytes) -> dict:
     def take_below(page, span, regex, y_window=40):
         x0, y0, x1, y1 = span["bbox"]
         rect = fitz.Rect(x0, y1, x1 + 250, y1 + y_window)  # zona debajo y un poco a la derecha
-        words = page.get_text("words")  # [(x0,y0,x1,y1,"text",block,line,word_no), ...]
+        words = page.get_text("words")
         line_texts = []
         for w in words:
             wx0, wy0, wx1, wy1, wtxt, *_ = w
@@ -206,6 +249,17 @@ def extract_by_coords_pdf(pdf_bytes: bytes) -> dict:
         candidate = " ".join([t[1] for t in line_texts])
         m = regex.search(candidate)
         return norm_spaces(m.group(1)) if m else None
+
+    def take_after_colon_same_line(line_spans, idx_label, max_chars=40):
+        """Devuelve lo que viene tras ':' en la MISMA línea de la etiqueta."""
+        x_end = line_spans[idx_label]["bbox"][2]
+        tail_tokens = [s["text"] for s in line_spans if s["bbox"][0] >= x_end + 2]
+        tail = " ".join(tail_tokens)
+        if ':' in tail:
+            after = tail.split(':', 1)[1].strip()
+        else:
+            after = tail.strip()
+        return norm_spaces(after[:max_chars]) if after else None
 
     prov_candidates = []
 
@@ -228,14 +282,14 @@ def extract_by_coords_pdf(pdf_bytes: bytes) -> dict:
                         val = take_right(spans, i, value_num)
                         if val: out.setdefault("n_factura", val)
 
-                # Fecha Emis y Venc (derecha o debajo)
+                # Fecha Emis y Venc (derecha o debajo, ventana pequeña)
                 for i, s in enumerate(spans):
                     if lbl_emis.search(s["text"]):
-                        val = take_right(spans, i, value_date) or take_below(page, s, value_date, y_window=50)
+                        val = take_right(spans, i, value_date) or take_below(page, s, value_date, y_window=40)
                         if val: out.setdefault("fecha_emis", to_iso_date(val))
                 for i, s in enumerate(spans):
                     if lbl_venc.search(s["text"]):
-                        val = take_right(spans, i, value_date) or take_below(page, s, value_date, y_window=50)
+                        val = take_right(spans, i, value_date) or take_below(page, s, value_date, y_window=40)
                         if val: out.setdefault("fecha_venc", to_iso_date(val))
 
                 # Folio: debajo primero
@@ -244,16 +298,16 @@ def extract_by_coords_pdf(pdf_bytes: bytes) -> dict:
                         val = take_below(page, s, value_folio, y_window=60) or take_right(spans, i, value_folio)
                         if val: out.setdefault("folio", val)
 
-                # Forma de pago
+                # Forma de pago: SOLO misma línea y después de ':'
                 for i, s in enumerate(spans):
                     if lbl_pago.search(s["text"]):
-                        val = take_right(spans, i, value_pago) or take_below(page, s, value_pago, y_window=60)
-                        if val:
-                            fp = val
-                            # normaliza crédito y dedup
-                            fp = re.sub(r'(Crédito)(?:\s*\1)+', r'\1', fp, flags=re.IGNORECASE)
-                            fp = fp.replace("Cr", "Crédito").replace("Cred.", "Crédito").replace("Credito","Crédito")
-                            out.setdefault("forma_pago", norm_spaces(fp))
+                        raw_txt = take_after_colon_same_line(spans, i, max_chars=40)
+                        if raw_txt:
+                            m = VALUE_PAGO_RE.search(raw_txt)
+                            if m:
+                                fp = normalize_pago(m.group(0))
+                                if fp:
+                                    out.setdefault("forma_pago", fp)
 
                 # Total en línea
                 if re.search(r'\bTotal(?:\s*a\s*pagar)?\b', line_text, re.IGNORECASE):
@@ -302,18 +356,22 @@ def extract_ocr_page(img: Image.Image) -> dict:
     val_num   = re.compile(r'(\d{3,})')
     val_date  = re.compile(DATE_PAT, re.IGNORECASE)
     val_folio = re.compile(FOLIO_PAT, re.IGNORECASE)
-    val_pago  = re.compile(r'([A-Za-zÁÉÍÓÚÑáéíóúñ\. ]{3,})')
+    # forma de pago usa VALUE_PAGO_RE
 
     out = {}
     out["n_factura"]  = find_adjacent_value(words, lbl_num,   val_num)
     out["fecha_emis"] = to_iso_date(find_adjacent_value(words, lbl_emis,  val_date))
     out["fecha_venc"] = to_iso_date(find_adjacent_value(words, lbl_venc,  val_date))
     out["folio"]      = find_adjacent_value(words, lbl_folio, val_folio, prefer_below=True)
-    fp = find_adjacent_value(words, lbl_pago,  val_pago)
-    if fp:
-        fp = re.sub(r'(Crédito)(?:\s*\1)+', r'\1', fp, flags=re.IGNORECASE)
-        fp = fp.replace("Cr", "Crédito").replace("Cred.", "Crédito").replace("Credito","Crédito")
-    out["forma_pago"] = norm_spaces(fp) if fp else None
+
+    # Forma de pago: SOLO misma línea (después de ':')
+    fp_txt = find_same_line_after_colon(words, lbl_pago, max_tokens=6)
+    fp = None
+    if fp_txt:
+        m = VALUE_PAGO_RE.search(fp_txt)
+        if m:
+            fp = normalize_pago(m.group(0))
+    out["forma_pago"] = fp if fp else None
 
     # Proveedor por sufijos / RUT (OCR)
     prov = None
@@ -369,10 +427,9 @@ def extract_pdf_text_fallback(file_bytes: bytes) -> dict:
     out["folio"] = m.group(1) if m else None
     m = re.search(r'Forma\s+de\s*pago\s*[:\-]?\s*([A-Za-zÁÉÍÓÚÑáéíóúñ\. ]+)', txt, re.IGNORECASE)
     if m:
-        fp = norm_spaces(m.group(1))
-        fp = re.sub(r'(Crédito)(?:\s*\1)+', r'\1', fp, flags=re.IGNORECASE)
-        fp = fp.replace("Cr", "Crédito").replace("Cred.", "Crédito").replace("Credito","Crédito")
-        out["forma_pago"] = fp
+        m2 = VALUE_PAGO_RE.search(m.group(1))
+        if m2:
+            out["forma_pago"] = normalize_pago(m2.group(0))
     m = re.search(r'Firma.*?'+DATE_PAT, txt, re.IGNORECASE|re.DOTALL)
     out["fecha_firma"] = to_iso_date(m.group(1)) if m else None
     m = re.search(r'Total(?:\s*a\s*pagar)?\s*[:\-]?\s*'+MONEY_PAT, txt, re.IGNORECASE)
@@ -381,7 +438,7 @@ def extract_pdf_text_fallback(file_bytes: bytes) -> dict:
 
 # ----------------- UI -----------------
 st.title("🧾 Extractor de Facturas (robusto)")
-st.caption("Coord. PyMuPDF + OCR con preprocesado. Lee valores a la derecha o DEBAJO de las etiquetas. Reglas para proveedor (sufijos/RUT).")
+st.caption("Coord. PyMuPDF + OCR con preprocesado. 'Forma de pago' solo misma línea tras ':'. Lee valores a la derecha o DEBAJO según etiqueta.")
 
 uploads = st.file_uploader(
     "Sube uno o varios archivos (PDF/PNG/JPG).",
@@ -450,4 +507,4 @@ if uploads:
     st.download_button("📥 Descargar CSV", data=csv, file_name="facturas_extraidas.csv", mime="text/csv")
     st.text_area("CSV (copiar/pegar)", csv, height=160)
 else:
-    st.info("Sube archivos para comenzar. Captura 'Folio' debajo de la etiqueta y normaliza fechas tipo '30 septiembre 2025'.")
+    st.info("Sube archivos para comenzar. Captura 'Folio' debajo, 'Forma de pago' solo en la misma línea, y normaliza fechas como '30 septiembre 2025'.")
