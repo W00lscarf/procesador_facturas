@@ -5,7 +5,7 @@ from dataclasses import dataclass
 
 import streamlit as st
 import pandas as pd
-from PIL import Image, ImageOps, ImageFilter, ImageEnhance
+from PIL import Image, ImageOps, ImageEnhance
 
 import pytesseract
 import fitz  # PyMuPDF
@@ -23,9 +23,12 @@ DATE_TXT = r'(\d{1,2}\s+(?:enero|febrero|marzo|abril|mayo|junio|julio|agosto|sep
 DATE_NUM = r'(\d{1,2}[\/\.\-]\d{1,2}[\/\.\-]\d{2,4})'
 DATE_PAT = rf'(?:{DATE_TXT}|{DATE_NUM})'
 MONEY_PAT = r'(\$?\s*\d{1,3}(?:[.\s]\d{3})*(?:[\,\.]\d{2})?)'
-FOLIO_PAT = r'([A-Z0-9\-]{5,})'
+# evita capturar "Fecha", permite alfanuméricos con guiones y longitud mínima
+FOLIO_PAT = r'((?!Fecha)\b[A-Z0-9][A-Z0-9\-]{3,})'
 RUT_PAT   = r'\b\d{1,2}\.?\d{3}\.?\d{3}-[0-9Kk]\b'
 CORP_SUFFIXES = ['SPA','SpA','S.A.','SA','LTDA','Ltda','EIRL','LIMITADA']
+BAD_PREFIXES = ["DATOS DESPACHO", "DATOS DESPACHO O INSTALACION", "DATOS DESPACHO O INSTALACIÓN",
+                "DIRECCION", "DIRECCIÓN", "ENVIO", "ENVÍO", "UBICACION", "UBICACIÓN"]
 
 def norm_spaces(s: Optional[str]) -> Optional[str]:
     if s is None: return None
@@ -56,6 +59,12 @@ def to_iso_date(s: Optional[str]) -> Optional[str]:
         return f"{y:04d}-{mo:02d}-{d:02d}"
     return s
 
+def is_good_provider_line(t: str) -> bool:
+    T = t.upper().strip(": ").strip()
+    if any(T.startswith(p) for p in BAD_PREFIXES):
+        return False
+    return any(suf in T for suf in ["SPA","S.A.","LTDA","EIRL","SpA","SA","LIMITADA"])
+
 # ----------------- Rasterizar PDF (PyMuPDF) -----------------
 def pdf_to_images(pdf_bytes: bytes, dpi: int = 300) -> list[Image.Image]:
     images = []
@@ -72,14 +81,14 @@ def pdf_to_images(pdf_bytes: bytes, dpi: int = 300) -> list[Image.Image]:
 
 # ----------------- PREPROCESADO OCR -----------------
 def preprocess_for_ocr(img: Image.Image) -> Image.Image:
-    # Escala ×1.5, gris, aumento contraste/nitidez y binarización
+    # Escala ×1.5, gris, contraste
     w, h = img.size
-    img = img.resize((int(w*1.5), int(h*1.5)), Image.BICUBIC)
+    img = img.resize((int(w*1.5), int(h*1.5)))
     img = ImageOps.grayscale(img)
     img = ImageEnhance.Contrast(img).enhance(1.5)
-    img = ImageEnhance.Sharpness(img).enhance(1.2)
-    img = img.point(lambda x: 0 if x < 200 else 255, mode='1')  # umbral simple
-    return img.convert("L")
+    # binarización suave
+    img = img.point(lambda x: 0 if x < 200 else 255, mode='1').convert("L")
+    return img
 
 # ----------------- OCR TSV -----------------
 @dataclass
@@ -112,36 +121,59 @@ def lines_dict(words: List[Word]):
         lines[k].sort(key=lambda z: z.left)
     return lines
 
-def find_right_value(words: List[Word], label_regex: re.Pattern, value_regex: re.Pattern,
-                     x_gap=6, y_tol=22) -> Optional[str]:
+def find_adjacent_value(words: List[Word], label_regex: re.Pattern, value_regex: re.Pattern,
+                        x_gap=6, y_tol=22, prefer_below=False) -> Optional[str]:
+    """
+    Busca el valor a la derecha o debajo de la etiqueta (OCR).
+    - prefer_below=True: intenta debajo primero (útil para 'Folio').
+    """
     L = lines_dict(words)
-    for key, ws in L.items():
-        line_text = " ".join([w.text for w in ws])
-        if label_regex.search(line_text):
-            label_end_x = None
-            for w in ws:
-                if label_regex.search(w.text):
-                    label_end_x = w.right
-            if label_end_x is None: continue
-            tail = " ".join([w.text for w in ws if w.left >= label_end_x + x_gap])
-            m = value_regex.search(tail)
-            if m: return norm_spaces(m.group(1))
-            target_mid = [w.mid_y for w in ws][-1]
-            for key2, ws2 in L.items():
-                if key2 == key: continue
-                same_band = abs(ws2[0].mid_y - target_mid) <= y_tol and ws2[0].left > label_end_x
-                if same_band:
-                    tail2 = " ".join([w.text for w in ws2])
-                    m2 = value_regex.search(tail2)
-                    if m2: return norm_spaces(m2.group(1))
-    return None
 
-# ----------------- PyMuPDF texto con coords (sin OCR) -----------------
+    def right_value():
+        for key, ws in L.items():
+            line_text = " ".join([w.text for w in ws])
+            if label_regex.search(line_text):
+                label_end_x = None
+                for w in ws:
+                    if label_regex.search(w.text):
+                        label_end_x = w.right
+                if label_end_x is None:
+                    continue
+                tail = " ".join([w.text for w in ws if w.left >= label_end_x + x_gap])
+                m = value_regex.search(tail)
+                if m:
+                    return norm_spaces(m.group(1))
+        return None
+
+    def below_value():
+        # busca en líneas siguientes con x cercano y dentro de tolerancia vertical ampliada
+        for key, ws in L.items():
+            if any(label_regex.search(w.text) for w in ws):
+                label_end_x = max([w.right for w in ws if label_regex.search(w.text)])
+                label_mid_y = ws[-1].mid_y
+                for key2, ws2 in L.items():
+                    if key2 == key:
+                        continue
+                    if (ws2[0].mid_y > label_mid_y) and (ws2[0].left >= label_end_x - 80) and \
+                       (ws2[0].left <= label_end_x + 280) and (ws2[0].mid_y - label_mid_y <= y_tol*2.5):
+                        candidate = " ".join([w.text for w in ws2])
+                        m = value_regex.search(candidate)
+                        if m:
+                            return norm_spaces(m.group(1))
+        return None
+
+    if prefer_below:
+        return below_value() or right_value()
+    else:
+        return right_value() or below_value()
+
+# ----------------- PyMuPDF: texto con coords (sin OCR) -----------------
 def extract_by_coords_pdf(pdf_bytes: bytes) -> dict:
-    """Usa el texto con coordenadas de PyMuPDF para leer valores a la derecha."""
+    """
+    Usa texto con coordenadas (PyMuPDF) para leer valores a la derecha o debajo.
+    """
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     out = {}
-    # patrones compilados
     lbl_num   = re.compile(r'^N[°º]$|N[°º]\b', re.IGNORECASE)
     lbl_emis  = re.compile(r'Fecha\s*Emis\.?', re.IGNORECASE)
     lbl_venc  = re.compile(r'Fecha\s*Venc\.?', re.IGNORECASE)
@@ -150,30 +182,44 @@ def extract_by_coords_pdf(pdf_bytes: bytes) -> dict:
     lbl_firma = re.compile(r'Firma', re.IGNORECASE)
     value_date  = re.compile(DATE_PAT, re.IGNORECASE)
     value_num   = re.compile(r'(\d{3,})')
-    value_folio = re.compile(FOLIO_PAT)
+    value_folio = re.compile(FOLIO_PAT, re.IGNORECASE)
     value_pago  = re.compile(r'([A-Za-zÁÉÍÓÚÑáéíóúñ\. ]{3,})')
 
     def take_right(line_spans, idx_label, regex):
-        """Dado el índice del span de la etiqueta, toma spans a su derecha en la misma línea."""
         x_end = line_spans[idx_label]["bbox"][2]
         tail_text = " ".join([s["text"] for s in line_spans if s["bbox"][0] >= x_end + 2])
         m = regex.search(tail_text)
         return norm_spaces(m.group(1)) if m else None
 
-    # proveedor helpers
+    def take_below(page, span, regex, y_window=40):
+        x0, y0, x1, y1 = span["bbox"]
+        rect = fitz.Rect(x0, y1, x1 + 250, y1 + y_window)  # zona debajo y un poco a la derecha
+        words = page.get_text("words")  # [(x0,y0,x1,y1,"text",block,line,word_no), ...]
+        line_texts = []
+        for w in words:
+            wx0, wy0, wx1, wy1, wtxt, *_ = w
+            if fitz.Rect(wx0, wy0, wx1, wy1).intersects(rect):
+                line_texts.append((wy0, wtxt))
+        if not line_texts:
+            return None
+        line_texts.sort(key=lambda t: t[0])
+        candidate = " ".join([t[1] for t in line_texts])
+        m = regex.search(candidate)
+        return norm_spaces(m.group(1)) if m else None
+
     prov_candidates = []
 
     for page in doc:
-        dicttext = page.get_text("dict")  # blocks -> lines -> spans
+        dicttext = page.get_text("dict")
         for b in dicttext.get("blocks", []):
             for l in b.get("lines", []):
                 spans = l.get("spans", [])
                 if not spans: 
                     continue
                 line_text = " ".join([s["text"] for s in spans]).strip()
-                # proveedor candidatos (líneas con sufijos)
-                if any(suf in line_text for suf in CORP_SUFFIXES):
-                    # limpia espacios y normaliza mayúsculas
+
+                # Proveedor: filtra líneas con sufijos corporativos reales (evita "DATOS DESPACHO...")
+                if is_good_provider_line(line_text):
                     prov_candidates.append(norm_spaces(line_text).upper())
 
                 # N°
@@ -181,33 +227,33 @@ def extract_by_coords_pdf(pdf_bytes: bytes) -> dict:
                     if lbl_num.search(s["text"]):
                         val = take_right(spans, i, value_num)
                         if val: out.setdefault("n_factura", val)
-                # Emis
+
+                # Fecha Emis y Venc (derecha o debajo)
                 for i, s in enumerate(spans):
                     if lbl_emis.search(s["text"]):
-                        val = take_right(spans, i, value_date)
+                        val = take_right(spans, i, value_date) or take_below(page, s, value_date, y_window=50)
                         if val: out.setdefault("fecha_emis", to_iso_date(val))
-                # Venc
                 for i, s in enumerate(spans):
                     if lbl_venc.search(s["text"]):
-                        val = take_right(spans, i, value_date)
+                        val = take_right(spans, i, value_date) or take_below(page, s, value_date, y_window=50)
                         if val: out.setdefault("fecha_venc", to_iso_date(val))
-                # Folio
+
+                # Folio: debajo primero
                 for i, s in enumerate(spans):
                     if lbl_folio.search(s["text"]):
-                        val = take_right(spans, i, value_folio)
+                        val = take_below(page, s, value_folio, y_window=60) or take_right(spans, i, value_folio)
                         if val: out.setdefault("folio", val)
+
                 # Forma de pago
                 for i, s in enumerate(spans):
                     if lbl_pago.search(s["text"]):
-                        val = take_right(spans, i, value_pago)
+                        val = take_right(spans, i, value_pago) or take_below(page, s, value_pago, y_window=60)
                         if val:
-                            fp = val.replace("Cr", "Crédito").replace("Cred.", "Crédito").replace("Credito","Crédito")
+                            fp = val
+                            # normaliza crédito y dedup
+                            fp = re.sub(r'(Crédito)(?:\s*\1)+', r'\1', fp, flags=re.IGNORECASE)
+                            fp = fp.replace("Cr", "Crédito").replace("Cred.", "Crédito").replace("Credito","Crédito")
                             out.setdefault("forma_pago", norm_spaces(fp))
-                # Firma
-                for i, s in enumerate(spans):
-                    if lbl_firma.search(s["text"]):
-                        val = take_right(spans, i, value_date)
-                        if val: out.setdefault("fecha_firma", to_iso_date(val))
 
                 # Total en línea
                 if re.search(r'\bTotal(?:\s*a\s*pagar)?\b', line_text, re.IGNORECASE):
@@ -215,20 +261,27 @@ def extract_by_coords_pdf(pdf_bytes: bytes) -> dict:
                     if m:
                         out.setdefault("monto_total", clean_money_to_float(m.group(1)))
 
-        # proveedor por RUT: toma línea anterior al RUT si existe
+        # Proveedor por RUT: toma la línea anterior al RUT si existe
         fulltext = page.get_text()
         rutm = re.search(RUT_PAT, fulltext)
         if rutm:
             pos = fulltext.find(rutm.group(0))
             before = fulltext[:pos]
             lines = [l.strip() for l in before.splitlines() if l.strip()]
-            if lines:
+            if lines and is_good_provider_line(lines[-1]):
                 prov_candidates.append(norm_spaces(lines[-1]).upper())
+
+        # Fallback Total (si no se encontró en línea): mayor monto >= 1000
+        if out.get("monto_total") is None:
+            money_vals = [clean_money_to_float(m) for m in re.findall(MONEY_PAT, fulltext)]
+            money_vals = [x for x in money_vals if x and x >= 1000]
+            if money_vals:
+                out["monto_total"] = max(money_vals)
 
     doc.close()
 
-    # Escoge proveedor: el candidato con sufijo corporativo y más largo
-    prov_candidates = [c for c in prov_candidates if any(suf in c for suf in ['SPA','S.A.','LTDA','EIRL','SpA','SA'])]
+    # Escoge proveedor con sufijo corporativo y más largo
+    prov_candidates = [c for c in prov_candidates if is_good_provider_line(c)]
     if prov_candidates:
         out["proveedor"] = max(prov_candidates, key=len)
 
@@ -248,24 +301,25 @@ def extract_ocr_page(img: Image.Image) -> dict:
 
     val_num   = re.compile(r'(\d{3,})')
     val_date  = re.compile(DATE_PAT, re.IGNORECASE)
-    val_folio = re.compile(FOLIO_PAT)
+    val_folio = re.compile(FOLIO_PAT, re.IGNORECASE)
     val_pago  = re.compile(r'([A-Za-zÁÉÍÓÚÑáéíóúñ\. ]{3,})')
 
     out = {}
-    out["n_factura"]  = find_right_value(words, lbl_num,   val_num)
-    out["fecha_emis"] = to_iso_date(find_right_value(words, lbl_emis,  val_date))
-    out["fecha_venc"] = to_iso_date(find_right_value(words, lbl_venc,  val_date))
-    out["folio"]      = find_right_value(words, lbl_folio, val_folio)
-    fp = find_right_value(words, lbl_pago,  val_pago)
+    out["n_factura"]  = find_adjacent_value(words, lbl_num,   val_num)
+    out["fecha_emis"] = to_iso_date(find_adjacent_value(words, lbl_emis,  val_date))
+    out["fecha_venc"] = to_iso_date(find_adjacent_value(words, lbl_venc,  val_date))
+    out["folio"]      = find_adjacent_value(words, lbl_folio, val_folio, prefer_below=True)
+    fp = find_adjacent_value(words, lbl_pago,  val_pago)
     if fp:
+        fp = re.sub(r'(Crédito)(?:\s*\1)+', r'\1', fp, flags=re.IGNORECASE)
         fp = fp.replace("Cr", "Crédito").replace("Cred.", "Crédito").replace("Credito","Crédito")
     out["forma_pago"] = norm_spaces(fp) if fp else None
 
-    # Proveedor por sufijos y por RUT en OCR
+    # Proveedor por sufijos / RUT (OCR)
     prov = None
     for _, ws in lines_dict(words).items():
         t = " ".join([w.text for w in ws])
-        if any(suf in t for suf in CORP_SUFFIXES):
+        if is_good_provider_line(t):
             prov = norm_spaces(t).upper(); break
     if not prov:
         full_ocr = pytesseract.image_to_string(imgp, lang="spa+eng")
@@ -274,18 +328,25 @@ def extract_ocr_page(img: Image.Image) -> dict:
             pos = full_ocr.find(rutm.group(0))
             before = full_ocr[:pos]
             lines = [l.strip() for l in before.splitlines() if l.strip()]
-            if lines:
+            if lines and is_good_provider_line(lines[-1]):
                 prov = norm_spaces(lines[-1]).upper()
     if prov: out["proveedor"] = prov
 
-    # Total
+    # Total (línea con 'Total'); fallback: mayor monto >= 1000 en OCR completo
     for _, ws in lines_dict(words).items():
         t = " ".join([w.text for w in ws])
         if re.search(r'\bTotal(?:\s*a\s*pagar)?\b', t, re.IGNORECASE):
             m = re.search(MONEY_PAT, t)
-            if m: 
+            if m:
                 out["monto_total"] = clean_money_to_float(m.group(1))
                 break
+    if out.get("monto_total") is None:
+        full_ocr = pytesseract.image_to_string(imgp, lang="spa+eng")
+        money_vals = [clean_money_to_float(m) for m in re.findall(MONEY_PAT, full_ocr)]
+        money_vals = [x for x in money_vals if x and x >= 1000]
+        if money_vals:
+            out["monto_total"] = max(money_vals)
+
     return out
 
 # ----------------- Fallback: texto embebido plano -----------------
@@ -297,8 +358,8 @@ def extract_pdf_text_fallback(file_bytes: bytes) -> dict:
     except:
         txt = ""
     if not txt.strip(): return out
-    m = re.search(r'([A-ZÁÉÍÓÚÑ0-9 ]+\s+(?:SPA|S\.A\.|LTDA|EIRL|SpA|SA))\b', txt)
-    if m: out["proveedor"] = norm_spaces(m.group(1).upper())
+    m = re.search(r'([A-ZÁÉÍÓÚÑ0-9 ]+\s+(?:SPA|S\.A\.|LTDA|EIRL|SpA|SA|LIMITADA))\b', txt)
+    if m and is_good_provider_line(m.group(1)): out["proveedor"] = norm_spaces(m.group(1)).upper()
     m = re.search(r'N[°º]\s*[:\-]?\s*(\d{3,})', txt);           out["n_factura"]  = m.group(1) if m else None
     m = re.search(r'Fecha\s*Emis\.?\s*[:\-]?\s*'+DATE_PAT, txt, re.IGNORECASE)
     out["fecha_emis"] = to_iso_date(m.group(1)) if m else None
@@ -309,6 +370,7 @@ def extract_pdf_text_fallback(file_bytes: bytes) -> dict:
     m = re.search(r'Forma\s+de\s*pago\s*[:\-]?\s*([A-Za-zÁÉÍÓÚÑáéíóúñ\. ]+)', txt, re.IGNORECASE)
     if m:
         fp = norm_spaces(m.group(1))
+        fp = re.sub(r'(Crédito)(?:\s*\1)+', r'\1', fp, flags=re.IGNORECASE)
         fp = fp.replace("Cr", "Crédito").replace("Cred.", "Crédito").replace("Credito","Crédito")
         out["forma_pago"] = fp
     m = re.search(r'Firma.*?'+DATE_PAT, txt, re.IGNORECASE|re.DOTALL)
@@ -319,7 +381,7 @@ def extract_pdf_text_fallback(file_bytes: bytes) -> dict:
 
 # ----------------- UI -----------------
 st.title("🧾 Extractor de Facturas (robusto)")
-st.caption("Usa texto con coordenadas (PyMuPDF) y OCR con preprocesado. Reglas especiales para proveedor (RUT/sufijos) y etiquetas a la derecha.")
+st.caption("Coord. PyMuPDF + OCR con preprocesado. Lee valores a la derecha o DEBAJO de las etiquetas. Reglas para proveedor (sufijos/RUT).")
 
 uploads = st.file_uploader(
     "Sube uno o varios archivos (PDF/PNG/JPG).",
@@ -335,7 +397,7 @@ if uploads:
 
         combined = {}
 
-        # 1) Intento: coordenadas PyMuPDF (sin OCR)
+        # 1) Coordenadas PyMuPDF (sin OCR)
         if f.name.lower().endswith(".pdf"):
             try:
                 coord_res = extract_by_coords_pdf(content)
@@ -388,4 +450,4 @@ if uploads:
     st.download_button("📥 Descargar CSV", data=csv, file_name="facturas_extraidas.csv", mime="text/csv")
     st.text_area("CSV (copiar/pegar)", csv, height=160)
 else:
-    st.info("Sube archivos para comenzar. Sugerencia: PDFs nítidos u OCR a 300 DPI.")
+    st.info("Sube archivos para comenzar. Captura 'Folio' debajo de la etiqueta y normaliza fechas tipo '30 septiembre 2025'.")
