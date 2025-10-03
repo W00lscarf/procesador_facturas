@@ -2,7 +2,6 @@
 import io, re
 from typing import List, Tuple, Optional
 from dataclasses import dataclass
-from datetime import datetime
 
 import streamlit as st
 import pandas as pd
@@ -41,6 +40,7 @@ def clean_money_to_float(s: Optional[str]) -> Optional[float]:
 def to_iso_date(s: Optional[str]) -> Optional[str]:
     if not s: return None
     t = s.strip().lower().replace('\\','/').replace('.', '/').replace('-', '/')
+    # 30 septiembre 2025
     m = re.match(r'(\d{1,2})\s+([a-záéíóúñ]+)\s+(\d{2,4})', t)
     if m:
         d, mon, y = m.groups()
@@ -48,6 +48,7 @@ def to_iso_date(s: Optional[str]) -> Optional[str]:
         if mon:
             y = int(y);  y = y+2000 if y < 100 else y
             return f"{y:04d}-{int(mon):02d}-{int(d):02d}"
+    # 30/09/2025
     m = re.match(r'(\d{1,2})/(\d{1,2})/(\d{2,4})', t)
     if m:
         d, mo, y = map(int, m.groups())
@@ -112,7 +113,6 @@ def find_right_value(words: List[Word], label_regex: re.Pattern, value_regex: re
 # ----------------- Rasterizar PDF con PyMuPDF -----------------
 def pdf_to_images_bytes(pdf_bytes: bytes, dpi: int = 300) -> list[Image.Image]:
     images = []
-    # scale factor for desired dpi (PyMuPDF default ~72 dpi)
     zoom = dpi / 72.0
     mat = fitz.Matrix(zoom, zoom)
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
@@ -200,4 +200,65 @@ def extract_pdf_text(file_bytes: bytes) -> dict:
 st.title("🧾 Extractor de Facturas (OCR robusto, sin Poppler)")
 st.caption("Rasteriza PDFs con PyMuPDF y usa OCR para leer valores a la derecha de las etiquetas (N°, Fecha Emis., Fecha Venc., Folio, Forma de pago).")
 
-uploads = st.file_uploader("Sube uno o varios archivo_
+uploads = st.file_uploader(
+    "Sube uno o varios archivos (PDF/PNG/JPG).",
+    type=["pdf","png","jpg","jpeg"],
+    accept_multiple_files=True
+)
+
+rows = []
+if uploads:
+    pb = st.progress(0.0)
+    for i, f in enumerate(uploads):
+        content = f.read()
+        # Si es PDF, rasterizamos con PyMuPDF; si no, abrimos como imagen
+        pages = []
+        if f.name.lower().endswith(".pdf"):
+            try:
+                pages = pdf_to_images_bytes(content, dpi=300)
+            except Exception as e:
+                st.error(f"{f.name}: no pude rasterizar con PyMuPDF ({e}).")
+        else:
+            try:
+                pages = [Image.open(io.BytesIO(content)).convert("RGB")]
+            except Exception as e:
+                st.error(f"{f.name}: no pude abrir como imagen ({e}).")
+
+        combined = {}
+        for p_idx, img in enumerate(pages, start=1):
+            o = extract_ocr_page(img)
+            for k, v in o.items():
+                if v and not combined.get(k):
+                    combined[k] = v
+
+        # Fallback por texto embebido (si el PDF tenía capa de texto útil)
+        t = extract_pdf_text(content)
+        for k, v in t.items():
+            if v and not combined.get(k):
+                combined[k] = v
+
+        def s(x): 
+            if x is None: return ""
+            return str(x)
+
+        rows.append({
+            "archivo": f.name,
+            "proveedor": s(combined.get("proveedor")),
+            "n_factura": s(combined.get("n_factura")),
+            "forma_pago": s(combined.get("forma_pago")),
+            "fecha_emis": s(combined.get("fecha_emis")),
+            "fecha_venc": s(combined.get("fecha_venc")),
+            "folio": s(combined.get("folio")),
+            "fecha_firma": s(combined.get("fecha_firma")),
+            "monto_total": s(combined.get("monto_total")),
+        })
+        pb.progress((i+1)/len(uploads))
+
+    df = pd.DataFrame(rows)
+    st.subheader("Tabla extraída (copiable)")
+    st.dataframe(df, use_container_width=True)
+    csv = df.to_csv(index=False, encoding="utf-8")
+    st.download_button("📥 Descargar CSV", data=csv, file_name="facturas_extraidas.csv", mime="text/csv")
+    st.text_area("CSV (copiar/pegar)", csv, height=160)
+else:
+    st.info("Sube archivos para comenzar. Esta versión no requiere Poppler.")
