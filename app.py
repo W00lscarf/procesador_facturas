@@ -89,25 +89,37 @@ def lines_dict(words: List[Word]):
 
 def find_right_value(words: List[Word], label_regex: re.Pattern, value_regex: re.Pattern,
                      x_gap=6, y_tol=18) -> Optional[str]:
+    """
+    Busca la etiqueta (label_regex) y captura el valor (value_regex) a la derecha.
+    NOTA: label_regex y value_regex ya están compilados, así que usamos .search() sin flags.
+    """
     L = lines_dict(words)
     for key, ws in L.items():
         line_text = " ".join([w.text for w in ws])
-        if re.search(label_regex, line_text, re.IGNORECASE):
+        if label_regex.search(line_text):
+            # extremo derecho de la etiqueta
             label_end_x = None
             for w in ws:
-                if re.search(label_regex, w.text, re.IGNORECASE): label_end_x = w.right
-            if label_end_x is None: continue
+                if label_regex.search(w.text):
+                    label_end_x = w.right
+            if label_end_x is None: 
+                continue
+            # 1) misma línea
             tail = " ".join([w.text for w in ws if w.left >= label_end_x + x_gap])
-            m = re.search(value_regex, tail, re.IGNORECASE)
-            if m: return norm_spaces(m.group(1))
+            m = value_regex.search(tail)
+            if m: 
+                return norm_spaces(m.group(1))
+            # 2) línea vecina (misma banda Y ± y_tol)
             target_mid = [w.mid_y for w in ws][-1]
             for key2, ws2 in L.items():
-                if key2 == key: continue
+                if key2 == key: 
+                    continue
                 same_band = abs(ws2[0].mid_y - target_mid) <= y_tol and ws2[0].left > label_end_x
                 if same_band:
                     tail2 = " ".join([w.text for w in ws2])
-                    m2 = re.search(value_regex, tail2, re.IGNORECASE)
-                    if m2: return norm_spaces(m2.group(1))
+                    m2 = value_regex.search(tail2)
+                    if m2: 
+                        return norm_spaces(m2.group(1))
     return None
 
 # ----------------- Rasterizar PDF con PyMuPDF -----------------
@@ -127,12 +139,13 @@ def pdf_to_images_bytes(pdf_bytes: bytes, dpi: int = 300) -> list[Image.Image]:
 # ----------------- Extracción -----------------
 def extract_ocr_page(img: Image.Image) -> dict:
     words = ocr_words(img)
-    lbl_num   = re.compile(r'^N[°º]$|N[°º]\b')
-    lbl_emis  = re.compile(r'Fecha\s*Emis\.?')
-    lbl_venc  = re.compile(r'Fecha\s*Venc\.?')
-    lbl_folio = re.compile(r'Folio')
-    lbl_pago  = re.compile(r'Forma\s*de\s*pago')
-    lbl_firma = re.compile(r'Firma')
+    # patrones COMPILADOS (sin pasar flags después)
+    lbl_num   = re.compile(r'^N[°º]$|N[°º]\b', re.IGNORECASE)
+    lbl_emis  = re.compile(r'Fecha\s*Emis\.?', re.IGNORECASE)
+    lbl_venc  = re.compile(r'Fecha\s*Venc\.?', re.IGNORECASE)
+    lbl_folio = re.compile(r'Folio', re.IGNORECASE)
+    lbl_pago  = re.compile(r'Forma\s*de\s*pago', re.IGNORECASE)
+    lbl_firma = re.compile(r'Firma', re.IGNORECASE)
 
     val_num   = re.compile(r'(\d{3,})')
     val_date  = re.compile(DATE_PAT, re.IGNORECASE)
@@ -140,11 +153,11 @@ def extract_ocr_page(img: Image.Image) -> dict:
     val_pago  = re.compile(r'([A-Za-zÁÉÍÓÚÑáéíóúñ\. ]{3,})')
 
     out = {}
-    out["n_factura"]   = find_right_value(words, lbl_num, val_num)
-    out["fecha_emis"]  = to_iso_date(find_right_value(words, lbl_emis, val_date))
-    out["fecha_venc"]  = to_iso_date(find_right_value(words, lbl_venc, val_date))
+    out["n_factura"]   = find_right_value(words, lbl_num,   val_num)
+    out["fecha_emis"]  = to_iso_date(find_right_value(words, lbl_emis,  val_date))
+    out["fecha_venc"]  = to_iso_date(find_right_value(words, lbl_venc,  val_date))
     out["folio"]       = find_right_value(words, lbl_folio, val_folio)
-    fp = find_right_value(words, lbl_pago, val_pago)
+    fp = find_right_value(words, lbl_pago,  val_pago)
     if fp:
         fp = fp.replace("Cr", "Crédito").replace("Cred.", "Crédito").replace("Credito","Crédito")
     out["forma_pago"]  = norm_spaces(fp) if fp else None
@@ -164,7 +177,9 @@ def extract_ocr_page(img: Image.Image) -> dict:
         t = " ".join([w.text for w in ws])
         if re.search(r'\bTotal(?:\s*a\s*pagar)?\b', t, re.IGNORECASE):
             m = re.search(MONEY_PAT, t)
-            if m: total = clean_money_to_float(m.group(1)); break
+            if m: 
+                total = clean_money_to_float(m.group(1)); 
+                break
     out["monto_total"] = total
     return out
 
